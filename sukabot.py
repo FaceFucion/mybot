@@ -151,8 +151,10 @@ async def cb_work(call: CallbackQuery):
     left = WORK_COOLDOWN - (now - last)
 
     if left > 0:
-        m, s = divmod(left, 60)
-        return await call.message.answer(f"⏳ Подожди ещё <b>{m}м {s}с</b>")
+        h, remainder = divmod(left, 3600)
+        m, s = divmod(remainder, 60)
+        time_str = f"{h}ч {m}м {s}с" if h else f"{m}м {s}с"
+        return await call.message.answer(f"⏳ Подожди ещё <b>{time_str}</b>")
 
     earn = random.randint(1, 25)
     await change_balance(uid, earn)
@@ -197,8 +199,10 @@ async def router(message: Message):
         left = WORK_COOLDOWN - (now - last)
 
         if left > 0:
-            m, s = divmod(left, 60)
-            return await message.answer(f"⏳ Подожди ещё <b>{m}м {s}с</b>")
+            h, remainder = divmod(left, 3600)
+            m, s = divmod(remainder, 60)
+            time_str = f"{h}ч {m}м {s}с" if h else f"{m}м {s}с"
+            return await message.answer(f"⏳ Подожди ещё <b>{time_str}</b>")
 
         earn = random.randint(1, 25)
         await change_balance(uid, earn)
