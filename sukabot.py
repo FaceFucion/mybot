@@ -26,8 +26,47 @@ DB_PATH = "glw_coins.db"
 
 WORK_COOLDOWN = 7200  # 2 часа
 
+DUEL_ACCEPT_TIMEOUT = 120   # 2 минуты на принятие вызова
+DUEL_BETTING_WINDOW = 60    # 1 минута на ставки зрителей
+DUEL_SHOT_TIMEOUT = 60      # таймаут на выстрел (чтобы дуэль не висела вечно)
+
+# ── СЛОТЫ (с казик) ──────────────────────────────────────────────────────────
+SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "🍉", "⭐", "💎", "7️⃣"]
+SLOT_WEIGHTS = [30, 25, 20, 15, 6, 3, 1]  # чем реже символ, тем больше выплата
+
+# множитель для 3 одинаковых символов (включает возврат ставки)
+SLOT_PAYOUTS_TRIPLE = {
+    "🍒": 2,
+    "🍋": 3,
+    "🍇": 4,
+    "🍉": 5,
+    "⭐": 8,
+    "💎": 15,
+    "7️⃣": 50,
+}
+SLOT_PAYOUT_PAIR = 1.2  # множитель за любую пару из трёх (утешительный приз)
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+
+# ── ГЛОБАЛЬНОЕ СОСТОЯНИЕ ДУЭЛЕЙ (in-memory, сбрасывается при рестарте) ───────
+# chat_id -> dict с данными активной дуэли
+duels: dict[int, dict] = {}
+
+
+# ── ВСПОМОГАТЕЛЬНОЕ ──────────────────────────────────────────────────────────
+
+def fmt(n: int) -> str:
+    """Форматирует число с разделителями разрядов: 100000 -> 100,000"""
+    return f"{n:,}"
+
+
+def display_name(user) -> str:
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    first_name = getattr(user, "first_name", None)
+    return first_name or f"ID {getattr(user, 'id', '?')}"
 
 
 # ── БАЗА ДАННЫХ ──────────────────────────────────────────────────────────────
@@ -124,22 +163,45 @@ def welcome_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def coin_keyboard(owner_id: int, amount: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🦅 Орёл", callback_data=f"coin:{owner_id}:{amount}:orel"),
+            InlineKeyboardButton(text="🪙 Решка", callback_data=f"coin:{owner_id}:{amount}:reshka"),
+        ]
+    ])
+
+
+def duel_accept_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять вызов", callback_data=f"duel_accept:{chat_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duel_decline:{chat_id}"),
+        ]
+    ])
+
+
 def commands_text() -> str:
     return (
         f"📌 <b>Команды бота:</b>\n\n"
         f"• <b>счёт</b> — посмотреть свой баланс\n"
         f"• <b>счёт</b> (реплай) — баланс другого игрока\n"
         f"• <b>ворк</b> — заработать тинки (КД 2 часа)\n"
-        f"• <b>передать [сумма]</b> (реплай) — перевести тинки другому игроку\n"
+        f"• <b>дать [сумма]</b> (реплай) — перевести тинки другому игроку\n"
         f"• <b>топ богачей</b> — рейтинг игроков\n"
         f"• <b>коммандс</b> — список команд\n\n"
+        f"<i>Казино:</i>\n"
+        f"• <b>м казик [сумма]</b> — монетка орёл/решка (x2)\n"
+        f"• <b>с казик [сумма]</b> — слоты 🎰 (3 одинаковых — джекпот)\n"
+        f"• <b>батл [сумма] @юзер</b> (или реплаем) — русская рулетка, стреляешь в себя (1/6)\n"
+        f"• <b>ставка [а/б] [сумма]</b> — ставка на исход дуэли (только во время сбора ставок)\n\n"
         f"<i>Админ-команды (реплай):</i>\n"
         f"• <b>начислить [сумма]</b>\n"
         f"• <b>списать [сумма]</b>"
     )
 
 
-# ── ХЭНДЛЕРЫ ─────────────────────────────────────────────────────────────────
+# ── ХЭНДЛЕРЫ СТАРТА / КНОПОК ГЛАВНОГО МЕНЮ ───────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -168,7 +230,7 @@ async def cb_balance(call: CallbackQuery):
     uid = call.from_user.id
     await ensure_user(uid)
     bal = await get_balance(uid)
-    await call.message.answer(f"💎 Твой счёт: <b>{bal}</b> тинки {TINKY_EMOJI}")
+    await call.message.answer(f"💎 Твой счёт: <b>{fmt(bal)}</b> тинки {TINKY_EMOJI}")
 
 
 @dp.callback_query(F.data == "do_work")
@@ -193,17 +255,221 @@ async def cb_work(call: CallbackQuery):
     bal = await get_balance(uid)
 
     await call.message.answer(
-        f"💼 Ты заработал <b>+{earn}</b> тинки {TINKY_EMOJI}\n"
-        f"💎 Счёт: <b>{bal}</b> тинки"
+        f"💼 Ты заработал <b>+{fmt(earn)}</b> тинки {TINKY_EMOJI}\n"
+        f"💎 Счёт: <b>{fmt(bal)}</b> тинки"
     )
+
+
+# ── КАЗИНО: МОНЕТКА (м казик [сумма]) ───────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("coin:"))
+async def cb_coin(call: CallbackQuery):
+    _, owner_id_str, amount_str, choice = call.data.split(":")
+    owner_id = int(owner_id_str)
+    amount = int(amount_str)
+
+    if call.from_user.id != owner_id:
+        return await call.answer("❌ Это не твоя ставка!", show_alert=True)
+
+    await call.answer()
+
+    bal = await get_balance(owner_id)
+    if bal < amount:
+        return await call.message.edit_text("❌ Недостаточно тинки на счету — ставка отменена")
+
+    result = random.choice(["orel", "reshka"])
+    win = (result == choice)
+
+    await change_balance(owner_id, amount if win else -amount)
+    new_bal = await get_balance(owner_id)
+
+    result_text = "Орёл 🦅" if result == "orel" else "Решка 🪙"
+    choice_text = "Орёл 🦅" if choice == "orel" else "Решка 🪙"
+
+    if win:
+        text = (
+            f"🎉 Выпало: <b>{result_text}</b>\n"
+            f"Ты выбрал: <b>{choice_text}</b> — победа!\n"
+            f"💰 +{fmt(amount)} тинки {TINKY_EMOJI}\n"
+            f"💎 Счёт: <b>{fmt(new_bal)}</b>"
+        )
+    else:
+        text = (
+            f"😢 Выпало: <b>{result_text}</b>\n"
+            f"Ты выбрал: <b>{choice_text}</b> — проигрыш\n"
+            f"💸 -{fmt(amount)} тинки {TINKY_EMOJI}\n"
+            f"💎 Счёт: <b>{fmt(new_bal)}</b>"
+        )
+
+    await call.message.edit_text(text)
+
+
+# ── ДУЭЛИ (батл / ставка / стрелять) ────────────────────────────────────────
+
+async def duel_accept_timeout_task(chat_id: int):
+    await asyncio.sleep(DUEL_ACCEPT_TIMEOUT)
+    duel = duels.get(chat_id)
+    if duel and duel["status"] == "pending":
+        del duels[chat_id]
+        await bot.send_message(
+            chat_id,
+            f"⏳ Вызов от {duel['a_name']} на дуэль истёк — {duel['b_name']} не ответил вовремя."
+        )
+
+
+async def duel_betting_timeout_task(chat_id: int):
+    await asyncio.sleep(DUEL_BETTING_WINDOW)
+    duel = duels.get(chat_id)
+    if duel and duel["status"] == "betting":
+        duel["status"] = "fighting"
+        await bot.send_message(
+            chat_id,
+            f"🔒 Ставки закрыты!\n\n"
+            f"⚔️ Дуэль начинается: {duel['a_name']} 🆚 {duel['b_name']}\n"
+            f"🔫 Это русская рулетка: каждый стреляет <b>сам в себя</b>, шанс словить пулю — 1 из 6.\n"
+            f"Первым крутит барабан {duel['a_name']} — напиши <b>стрелять</b>"
+        )
+
+
+async def duel_shot_timeout_task(chat_id: int, shooter_id: int):
+    await asyncio.sleep(DUEL_SHOT_TIMEOUT)
+    duel = duels.get(chat_id)
+    if duel and duel["status"] == "fighting" and duel["turn"] == shooter_id:
+        # игрок не выстрелил вовремя — засчитываем ему поражение
+        winner_id = duel["b"] if shooter_id == duel["a"] else duel["a"]
+        await finish_duel(chat_id, winner_id, timeout=True)
+
+
+async def finish_duel(chat_id: int, winner_id: int, timeout: bool = False):
+    duel = duels.get(chat_id)
+    if not duel:
+        return
+
+    loser_id = duel["b"] if winner_id == duel["a"] else duel["a"]
+    winner_name = duel["a_name"] if winner_id == duel["a"] else duel["b_name"]
+    loser_name = duel["b_name"] if winner_id == duel["a"] else duel["a_name"]
+
+    prize = duel["amount"] * 2
+    await change_balance(winner_id, prize)
+
+    lines = []
+    if timeout:
+        lines.append(f"⏳ {loser_name} не выстрелил вовремя и проиграл по таймауту!")
+    lines.append(f"🏆 Победитель дуэли: <b>{winner_name}</b>")
+    lines.append(f"💰 Приз: <b>{fmt(prize)}</b> тинки {TINKY_EMOJI}")
+
+    # расчёт ставок зрителей
+    winner_side = "a" if winner_id == duel["a"] else "b"
+    loser_side = "b" if winner_side == "a" else "a"
+
+    winner_pool = sum(b["amount"] for b in duel["bets"].values() if b["side"] == winner_side)
+    loser_pool = sum(b["amount"] for b in duel["bets"].values() if b["side"] == loser_side)
+
+    if winner_pool > 0 and loser_pool > 0:
+        lines.append("\n💸 <b>Выплаты зрителям:</b>")
+        for bettor_id, bet in duel["bets"].items():
+            if bet["side"] == winner_side:
+                share = bet["amount"] + int(bet["amount"] * (loser_pool / winner_pool))
+                await change_balance(bettor_id, share)
+                lines.append(f"• {bet['name']}: +{fmt(share)} {TINKY_EMOJI}")
+    elif winner_pool > 0 and loser_pool == 0:
+        # ставившие на победителя просто получают свои деньги назад (некого делить)
+        for bettor_id, bet in duel["bets"].items():
+            if bet["side"] == winner_side:
+                await change_balance(bettor_id, bet["amount"])
+        lines.append("\n💸 Ставок на проигравшего не было — ставки на победителя возвращены")
+
+    await bot.send_message(chat_id, "\n".join(lines))
+    del duels[chat_id]
+
+
+@dp.callback_query(F.data.startswith("duel_accept:"))
+async def cb_duel_accept(call: CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    duel = duels.get(chat_id)
+
+    if not duel or duel["status"] != "pending":
+        return await call.answer("❌ Этот вызов больше не активен", show_alert=True)
+
+    if call.from_user.id != duel["b"]:
+        return await call.answer("❌ Этот вызов не тебе", show_alert=True)
+
+    await ensure_user(duel["b"])
+    bal_a = await get_balance(duel["a"])
+    bal_b = await get_balance(duel["b"])
+    amount = duel["amount"]
+
+    if bal_a < amount:
+        del duels[chat_id]
+        await call.answer()
+        return await call.message.edit_text(f"❌ У {duel['a_name']} недостаточно тинки — дуэль отменена")
+
+    if bal_b < amount:
+        del duels[chat_id]
+        await call.answer()
+        return await call.message.edit_text(f"❌ У тебя недостаточно тинки для этой ставки — дуэль отменена")
+
+    await change_balance(duel["a"], -amount)
+    await change_balance(duel["b"], -amount)
+
+    duel["status"] = "betting"
+    duel["turn"] = duel["a"]
+
+    await call.answer()
+    await call.message.edit_text(
+        f"✅ Вызов принят! {duel['a_name']} 🆚 {duel['b_name']}\n"
+        f"💰 Банк дуэли: <b>{fmt(amount * 2)}</b> тинки {TINKY_EMOJI}\n\n"
+        f"🎲 Открыты ставки для зрителей на <b>{DUEL_BETTING_WINDOW} сек.</b>\n"
+        f"Команда: <b>ставка а [сумма]</b> — за {duel['a_name']}\n"
+        f"Команда: <b>ставка б [сумма]</b> — за {duel['b_name']}"
+    )
+    asyncio.create_task(duel_betting_timeout_task(chat_id))
+
+
+@dp.callback_query(F.data.startswith("duel_decline:"))
+async def cb_duel_decline(call: CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    duel = duels.get(chat_id)
+
+    if not duel or duel["status"] != "pending":
+        return await call.answer("❌ Этот вызов больше не активен", show_alert=True)
+
+    if call.from_user.id != duel["b"]:
+        return await call.answer("❌ Этот вызов не тебе", show_alert=True)
+
+    del duels[chat_id]
+    await call.answer()
+    await call.message.edit_text(f"❌ {duel['b_name']} отклонил вызов от {duel['a_name']}")
+
+
+async def resolve_target_user(message: Message):
+    """Определяет цель дуэли: через реплай или через @username в тексте."""
+    if message.reply_to_message:
+        return message.reply_to_message.from_user
+
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "text_mention":
+                return ent.user
+            if ent.type == "mention":
+                username = message.text[ent.offset + 1: ent.offset + ent.length]
+                try:
+                    chat = await bot.get_chat(f"@{username}")
+                    return chat
+                except Exception:
+                    return None
+    return None
 
 
 # ── ТЕКСТОВЫЙ РОУТЕР ─────────────────────────────────────────────────────────
 
 @dp.message(F.text)
 async def router(message: Message):
+    raw_parts = message.text.strip().split()
     text = message.text.lower().strip()
+    parts = text.split()
     uid = message.from_user.id
+    chat_id = message.chat.id
 
     # КОММАНДС
     if text == "коммандс":
@@ -213,14 +479,14 @@ async def router(message: Message):
     if text in ("счёт", "счет"):
         await ensure_user(uid)
         bal = await get_balance(uid)
-        return await message.answer(f"💎 Твой счёт: <b>{bal}</b> тинки {TINKY_EMOJI}")
+        return await message.answer(f"💎 Твой счёт: <b>{fmt(bal)}</b> тинки {TINKY_EMOJI}")
 
     if (text.startswith("счёт") or text.startswith("счет")) and message.reply_to_message:
         target = message.reply_to_message.from_user
         await ensure_user(target.id)
         bal = await get_balance(target.id)
-        name = f"@{target.username}" if target.username else target.first_name
-        return await message.answer(f"💎 Счёт {name}: <b>{bal}</b> тинки {TINKY_EMOJI}")
+        name = display_name(target)
+        return await message.answer(f"💎 Счёт {name}: <b>{fmt(bal)}</b> тинки {TINKY_EMOJI}")
 
     # ВОРК
     if text == "ворк":
@@ -241,18 +507,239 @@ async def router(message: Message):
         bal = await get_balance(uid)
 
         return await message.answer(
-            f"💼 Ты заработал <b>+{earn}</b> тинки {TINKY_EMOJI}\n"
-            f"💎 Счёт: <b>{bal}</b> тинки"
+            f"💼 Ты заработал <b>+{fmt(earn)}</b> тинки {TINKY_EMOJI}\n"
+            f"💎 Счёт: <b>{fmt(bal)}</b> тинки"
         )
 
-    # ПЕРЕДАТЬ (перевод тинки другому игроку)
-    if text.startswith("передать"):
+    # КАЗИНО: М КАЗИК (монетка)
+    if len(parts) >= 3 and parts[0] == "м" and parts[1] == "казик":
+        try:
+            amount = int(parts[2])
+        except ValueError:
+            return await message.answer("❌ Сумма должна быть числом: м казик [сумма]")
+
+        if amount <= 0:
+            return await message.answer("❌ Сумма должна быть больше нуля")
+
+        await ensure_user(uid)
+        bal = await get_balance(uid)
+        if bal < amount:
+            return await message.answer("❌ Недостаточно тинки на счету")
+
+        return await message.answer(
+            f"🎰 Ставка: <b>{fmt(amount)}</b> тинки {TINKY_EMOJI}\n"
+            f"Выбери сторону монеты:",
+            reply_markup=coin_keyboard(uid, amount)
+        )
+
+    # КАЗИНО: С КАЗИК (слоты)
+    if len(parts) >= 3 and parts[0] == "с" and parts[1] == "казик":
+        try:
+            amount = int(parts[2])
+        except ValueError:
+            return await message.answer("❌ Сумма должна быть числом: с казик [сумма]")
+
+        if amount <= 0:
+            return await message.answer("❌ Сумма должна быть больше нуля")
+
+        await ensure_user(uid)
+        bal = await get_balance(uid)
+        if bal < amount:
+            return await message.answer("❌ Недостаточно тинки на счету")
+
+        # сразу списываем ставку — дальше либо возвращаем с приплатой, либо нет
+        await change_balance(uid, -amount)
+
+        spin_msg = await message.answer(f"🎰 [ ❔ | ❔ | ❔ ]\nКрутим барабаны...")
+
+        reels = random.choices(SLOT_SYMBOLS, weights=SLOT_WEIGHTS, k=3)
+
+        # немного "анимации" для драйва
+        for frame in range(2):
+            await asyncio.sleep(0.6)
+            teaser = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+            teaser[frame % 3] = reels[frame % 3]
+            await spin_msg.edit_text(f"🎰 [ {' | '.join(teaser)} ]\nКрутим барабаны...")
+
+        await asyncio.sleep(0.6)
+
+        counts = {}
+        for s in reels:
+            counts[s] = counts.get(s, 0) + 1
+
+        if 3 in counts.values():
+            symbol = reels[0]
+            multiplier = SLOT_PAYOUTS_TRIPLE[symbol]
+            payout = amount * multiplier
+            await change_balance(uid, payout)
+            net = payout - amount
+            result_line = (
+                f"🎉 ТРИ ОДИНАКОВЫХ {symbol}{symbol}{symbol}! Джекпот x{multiplier}\n"
+                f"💰 Выигрыш: +{fmt(net)} тинки {TINKY_EMOJI}"
+            )
+        elif 2 in counts.values():
+            payout = int(amount * SLOT_PAYOUT_PAIR)
+            await change_balance(uid, payout)
+            net = payout - amount
+            if net > 0:
+                result_line = f"🙂 Пара совпала! Небольшой выигрыш: +{fmt(net)} тинки {TINKY_EMOJI}"
+            elif net == 0:
+                result_line = "😐 Пара совпала, но выигрыш вышел в ноль — ставка вернулась"
+            else:
+                result_line = f"😐 Пара совпала, но этого мало: {fmt(net)} тинки {TINKY_EMOJI}"
+        else:
+            net = -amount
+            result_line = f"😢 Ничего не совпало. Проигрыш: {fmt(net)} тинки {TINKY_EMOJI}"
+
+        new_bal = await get_balance(uid)
+        await spin_msg.edit_text(
+            f"🎰 [ {' | '.join(reels)} ]\n\n"
+            f"{result_line}\n"
+            f"💎 Счёт: <b>{fmt(new_bal)}</b>"
+        )
+        return
+
+    # ДУЭЛЬ: БАТЛ [сумма] @юзер / реплай
+    if parts and parts[0] == "батл":
+        if chat_id in duels:
+            return await message.answer("❌ В этом чате уже есть активная дуэль")
+
+        if len(raw_parts) < 2:
+            return await message.answer("❌ Формат: батл [сумма] @юзер (или реплаем на сообщение)")
+
+        try:
+            amount = int(raw_parts[1])
+        except ValueError:
+            return await message.answer("❌ Сумма должна быть числом")
+
+        if amount <= 0:
+            return await message.answer("❌ Сумма должна быть больше нуля")
+
+        target = await resolve_target_user(message)
+        if not target:
+            return await message.answer("❌ Не могу найти игрока для дуэли — ответь на его сообщение или укажи @username")
+
+        if target.id == uid:
+            return await message.answer("❌ Нельзя вызвать самого себя")
+
+        if getattr(target, "is_bot", False):
+            return await message.answer("❌ Нельзя вызвать бота")
+
+        await ensure_user(uid)
+        await ensure_user(target.id)
+
+        bal = await get_balance(uid)
+        if bal < amount:
+            return await message.answer("❌ У тебя недостаточно тинки для такой ставки")
+
+        challenger_name = display_name(message.from_user)
+        target_name = display_name(target)
+
+        duels[chat_id] = {
+            "a": uid,
+            "b": target.id,
+            "a_name": challenger_name,
+            "b_name": target_name,
+            "amount": amount,
+            "status": "pending",
+            "turn": None,
+            "bets": {},
+        }
+
+        asyncio.create_task(duel_accept_timeout_task(chat_id))
+
+        return await message.answer(
+            f"⚔️ {challenger_name} вызывает {target_name} на дуэль!\n"
+            f"💰 Ставка: <b>{fmt(amount)}</b> тинки с каждого {TINKY_EMOJI}\n"
+            f"🏆 Победитель получит: <b>{fmt(amount * 2)}</b> тинки\n\n"
+            f"⏳ На принятие вызова {DUEL_ACCEPT_TIMEOUT // 60} минуты",
+            reply_markup=duel_accept_keyboard(chat_id)
+        )
+
+    # ДУЭЛЬ: СТАВКА (только во время фазы betting)
+    if len(parts) >= 3 and parts[0] == "ставка":
+        duel = duels.get(chat_id)
+        if not duel or duel["status"] != "betting":
+            return await message.answer("❌ Сейчас нет открытых ставок на дуэль")
+
+        side_raw = parts[1]
+        if side_raw in ("а", "a", "1"):
+            side = "a"
+        elif side_raw in ("б", "b", "2"):
+            side = "b"
+        else:
+            return await message.answer("❌ Укажи сторону: ставка а [сумма] или ставка б [сумма]")
+
+        if uid in (duel["a"], duel["b"]):
+            return await message.answer("❌ Участники дуэли не могут делать ставки на неё")
+
+        try:
+            bet_amount = int(parts[2])
+        except ValueError:
+            return await message.answer("❌ Сумма должна быть числом")
+
+        if bet_amount <= 0:
+            return await message.answer("❌ Сумма должна быть больше нуля")
+
+        await ensure_user(uid)
+        bal = await get_balance(uid)
+        if bal < bet_amount:
+            return await message.answer("❌ Недостаточно тинки на счету")
+
+        await change_balance(uid, -bet_amount)
+
+        if uid in duel["bets"]:
+            # если уже ставил — добавляем к текущей ставке (сторону не меняем)
+            duel["bets"][uid]["amount"] += bet_amount
+        else:
+            duel["bets"][uid] = {
+                "side": side,
+                "amount": bet_amount,
+                "name": display_name(message.from_user),
+            }
+
+        side_name = duel["a_name"] if side == "a" else duel["b_name"]
+        return await message.answer(
+            f"✅ Ставка принята: <b>{fmt(bet_amount)}</b> тинки за {side_name} {TINKY_EMOJI}"
+        )
+
+    # ДУЭЛЬ: СТРЕЛЯТЬ
+    if text == "стрелять":
+        duel = duels.get(chat_id)
+        if not duel or duel["status"] != "fighting":
+            return  # молча игнорируем вне контекста дуэли
+
+        if uid != duel["turn"]:
+            return await message.answer("❌ Сейчас не твой ход")
+
+        roll = random.randint(1, 6)
+        shooter_name = duel["a_name"] if uid == duel["a"] else duel["b_name"]
+
+        if roll == 1:
+            winner_id = duel["b"] if uid == duel["a"] else duel["a"]
+            await message.answer(
+                f"💥 БАХ! {shooter_name} выстрелил себе в висок и выбывает из дуэли..."
+            )
+            return await finish_duel(chat_id, winner_id)
+
+        other_id = duel["b"] if uid == duel["a"] else duel["a"]
+        other_name = duel["b_name"] if uid == duel["a"] else duel["a_name"]
+        duel["turn"] = other_id
+
+        asyncio.create_task(duel_shot_timeout_task(chat_id, other_id))
+
+        return await message.answer(
+            f"🔫 Клик! Осечка — {shooter_name} выстрелил в себя и выжил.\n"
+            f"Ход переходит к {other_name} — напиши <b>стрелять</b>"
+        )
+
+    # ДАТЬ (перевод тинки другому игроку)
+    if parts and parts[0] == "дать":
         if not message.reply_to_message:
             return await message.answer("❌ Ответь на сообщение игрока, которому хочешь передать тинки")
 
-        parts = text.split()
         if len(parts) < 2:
-            return await message.answer("❌ Укажи сумму: передать [сумма]")
+            return await message.answer("❌ Укажи сумму: дать [сумма]")
 
         try:
             amount = int(parts[1])
@@ -279,11 +766,11 @@ async def router(message: Message):
             return await message.answer("❌ Недостаточно тинки на счету")
 
         sender_bal = await get_balance(uid)
-        target_name = f"@{target.username}" if target.username else target.first_name
+        target_name = display_name(target)
 
         return await message.answer(
-            f"✅ Ты передал <b>{amount}</b> тинки игроку {target_name} {TINKY_EMOJI}\n"
-            f"💎 Твой счёт: <b>{sender_bal}</b>"
+            f"✅ Ты передал <b>{fmt(amount)}</b> тинки игроку {target_name} {TINKY_EMOJI}\n"
+            f"💎 Твой счёт: <b>{fmt(sender_bal)}</b>"
         )
 
     # ТОП БОГАЧЕЙ
@@ -303,12 +790,12 @@ async def router(message: Message):
         for i, (row_uid, bal) in enumerate(rows, 1):
             try:
                 user = await bot.get_chat(row_uid)
-                name = f"@{user.username}" if user.username else user.first_name
+                name = display_name(user)
             except Exception:
                 name = f"ID {row_uid}"
 
             prefix = medals.get(i, f"{i}.")
-            lines.append(f"{prefix} {name} — {bal} тинки {TINKY_EMOJI}")
+            lines.append(f"{prefix} {name} — {fmt(bal)} тинки {TINKY_EMOJI}")
 
         return await message.answer("\n".join(lines))
 
@@ -325,11 +812,11 @@ async def router(message: Message):
         await ensure_user(target.id)
         await change_balance(target.id, amount)
         bal = await get_balance(target.id)
-        name = f"@{target.username}" if target.username else target.first_name
+        name = display_name(target)
 
         return await message.answer(
-            f"✅ <b>{name}</b>: +{amount} тинки {TINKY_EMOJI}\n"
-            f"💎 Баланс: <b>{bal}</b>"
+            f"✅ <b>{name}</b>: +{fmt(amount)} тинки {TINKY_EMOJI}\n"
+            f"💎 Баланс: <b>{fmt(bal)}</b>"
         )
 
     # СПИСАТЬ (админ)
@@ -350,11 +837,11 @@ async def router(message: Message):
 
         await change_balance(target.id, -amount)
         new_bal = await get_balance(target.id)
-        name = f"@{target.username}" if target.username else target.first_name
+        name = display_name(target)
 
         return await message.answer(
-            f"💸 <b>{name}</b>: -{amount} тинки {TINKY_EMOJI}\n"
-            f"💎 Баланс: <b>{new_bal}</b>"
+            f"💸 <b>{name}</b>: -{fmt(amount)} тинки {TINKY_EMOJI}\n"
+            f"💎 Баланс: <b>{fmt(new_bal)}</b>"
         )
 
 
